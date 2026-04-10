@@ -13,6 +13,7 @@ import ast
 from pathlib import Path
 from collections import defaultdict
 
+from dotenv import load_dotenv
 import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS 
@@ -37,6 +38,8 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 PLUGIN_DIR = Path("plugins")
