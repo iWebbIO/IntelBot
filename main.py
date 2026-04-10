@@ -452,7 +452,10 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(traceback.format_exc())
-        await msg.reply_text(f"⚠️ Orchestrator Error: {e}")
+        try:
+            await msg.reply_text(f"⚠️ Orchestrator Error: {e}")
+        except Exception as reply_err:
+            logger.error(f"Failed to send error message to user: {reply_err}")
     finally:
         try: await msg.set_reaction(reaction=[])
         except: pass
