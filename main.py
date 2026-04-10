@@ -38,7 +38,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 PLUGIN_DIR = Path("plugins")
 PLUGIN_DIR.mkdir(exist_ok=True)
 DB_FILE = "bot_data.db"
@@ -109,6 +109,13 @@ class KeyRotationManager:
         conn = sqlite3.connect(DB_FILE)
         self.keys = [row[0] for row in conn.cursor().execute("SELECT api_key FROM api_keys WHERE is_active=1").fetchall()]
         conn.close()
+        env_key = os.getenv("GEMINI_API_KEY")
+        if env_key and env_key not in self.keys:
+            self.keys.append(env_key)
+
+    async def add_key(self, api_key: str):
+        await execute_db_write("INSERT OR IGNORE INTO api_keys (api_key) VALUES (?)", (api_key,))
+        self.refresh_keys()
 
     def _get_next_key(self):
         if not self.keys: raise Exception("No API keys found. Use /addkey")
@@ -162,8 +169,11 @@ class InternalPlugins:
                 except Exception as e: return f"Error: {e}"
             if url: return {"source": url, "content": fetch_url_text(url)}
             if query:
-                with DDGS() as ddgs: results = [r for r in ddgs.text(query, max_results=3)]
-                return {"query": query, "results": [{"title": r['title'], "url": r['href'], "content": fetch_url_text(r['href'])[:2000]} for r in results]}
+                try:
+                    with DDGS() as ddgs: results = [r for r in ddgs.text(query, max_results=3)]
+                    return {"query": query, "results": [{"title": r['title'], "url": r['href'], "content": fetch_url_text(r['href'])[:2000]} for r in results]}
+                except Exception as e:
+                    return {"error": f"Search failed: {e}"}
             return {"error": "Missing params"}
         return await asyncio.to_thread(_scrape)
 
@@ -178,19 +188,36 @@ class PluginManager:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30.0)
-        return json.loads(stdout.decode()) if stdout else {"error": stderr.decode()}
+        try:
+            return json.loads(stdout.decode()) if stdout else {"error": stderr.decode()}
+        except json.JSONDecodeError:
+            return {"output": stdout.decode(), "error": stderr.decode()}
 
     @staticmethod
     async def develop_plugin(prompt: str):
-        sys_inst = "Output JSON ONLY: {'filename': 'name', 'dependencies': ['pkg'], 'code': '...'}"
-        res = await key_manager.execute(ai_manager.models["pro"], sys_inst + "\n" + prompt)
+        sys_inst = (
+            "You are an expert Python developer. Create a plugin script.\n"
+            "The script will be called via: python plugin.py '{\"arg\": \"val\"}'\n"
+            "It MUST read sys.argv[1] as JSON, process it, and print ONLY a valid JSON string to stdout.\n"
+            "Output YOUR RESPONSE strictly in this format:\n"
+            "FILENAME: plugin_name\n"
+            "DEPENDENCIES: pkg1,pkg2 (or NONE)\n"
+            "CODE:\n```python\n# code here\n```"
+        )
+        res = await key_manager.execute(ai_manager.models["pro"], sys_inst + "\n\nInstructions: " + prompt)
         try:
-            raw = re.search(r'(\{.*\})', res.text, re.DOTALL).group().replace("'", '"')
-            data = json.loads(raw)
-            if data.get("dependencies"):
-                await asyncio.to_thread(lambda: [subprocess.run([sys.executable, "-m", "pip", "install", d]) for d in data["dependencies"]])
-            with open(PLUGIN_DIR / f"{data['filename']}.py", "w") as f: f.write(data["code"])
-            return {"status": "success", "plugin": data['filename']}
+            text = res.text
+            filename = re.search(r'FILENAME:\s*(\w+)', text).group(1)
+            deps_match = re.search(r'DEPENDENCIES:\s*(.+)', text)
+            dependencies = [d.strip() for d in deps_match.group(1).split(',')] if deps_match and "none" not in deps_match.group(1).lower() else []
+            
+            code_match = re.search(r'```(?:python)?\n(.*?)\n```', text, re.DOTALL)
+            code = code_match.group(1) if code_match else text
+
+            if dependencies:
+                await asyncio.to_thread(lambda: [subprocess.run([sys.executable, "-m", "pip", "install", d]) for d in dependencies if d])
+            with open(PLUGIN_DIR / f"{filename}.py", "w", encoding="utf-8") as f: f.write(code)
+            return {"status": "success", "plugin": filename, "message": "Plugin built and ready."}
         except Exception as e: return {"error": f"Build failed: {e}"}
 
 # Instances
@@ -247,8 +274,11 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if str(user_id) == bot_state.owner_id: await msg.reply_text("🛑 No API keys. Use /addkey <key>.")
         return
 
-    # Handle Voice
+    # Handle Voice and Documents
     audio_content = None
+    downloaded_file = None
+    status_msg = None
+    
     if msg.voice:
         status_msg = await msg.reply_text("🎧 Listening...")
         file = await context.bot.get_file(msg.voice.file_id)
@@ -259,8 +289,23 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         audio_content = types.Content(parts=[types.Part(file_data=types.FileData(file_uri=upload.uri, mime_type=upload.mime_type))])
         os.remove(path)
         await status_msg.delete()
+        status_msg = None
+    elif msg.document:
+        status_msg = await msg.reply_text("📥 Downloading file...")
+        file = await context.bot.get_file(msg.document.file_id)
+        downloaded_file = str(Path(msg.document.file_name or f"file_{msg.document.file_id}").resolve())
+        await file.download_to_drive(downloaded_file)
+        await status_msg.delete()
+        status_msg = None
 
-    user_text = msg.text or "[Attachment Processing]"
+    if downloaded_file:
+        user_text = f"User uploaded a file at path: {downloaded_file}. {msg.caption or ''}"
+    else:
+        user_text = msg.text or "[Attachment Processing]"
+
+    if msg.reply_to_message and msg.reply_to_message.text:
+        user_text += f"\n[In reply to: {msg.reply_to_message.text}]"
+
     current_level = "lite"
     decision, status_msg = None, None
     thinking_enabled = False
@@ -275,11 +320,12 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Instructed to use HTML for raw replies
             if current_level == "lite":
-                sys_route = f'Output VALID JSON ONLY. Chat: {{"action": "reply", "text": "html formatted text"}}. Scrape: {{"action": "run_plugin", "plugin_name": "web_scraper", "args": {{"query": "search"}}}}. Complex: {{"action": "escalate", "thinking_required": true}}. {btn_inst}'
+                sys_route = f'Output VALID JSON ONLY.\nChat: {{"action": "reply", "text": "html formatted text"}}\nScrape: {{"action": "run_plugin", "plugin_name": "web_scraper", "args": {{"query": "search"}}}}\nComplex/Plugins: {{"action": "escalate", "thinking_required": true}}\n{btn_inst}'
             else:
-                sys_route = f'JSON ONLY. Level: {current_level.upper()}. REQUIRED: "thought_summary" (3 words) and "thought_process". Action: "reply", "run_plugin", or "build_plugin". {btn_inst}'
+                sys_route = f'JSON ONLY. Level: {current_level.upper()}.\nREQUIRED: "thought_summary" (3 words) and "thought_process".\nAction: "reply", "run_plugin" (requires "plugin_name" and "args" dict), or "build_plugin" (requires "instructions" string describing the script).\n{btn_inst}'
 
-            parts = [types.Part(text=sys_route + "\nUser: " + user_text)]
+            chat_history = str(bot_state.memory.get(chat_id, [])[-10:])
+            parts = [types.Part(text=sys_route + f"\nHistory: {chat_history}\nUser: " + user_text)]
             if audio_content: parts.extend(audio_content.parts)
             
             res = await key_manager.execute(model_id, [types.Content(parts=parts)])
@@ -290,7 +336,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raw_text = res.text.replace("```json", "").replace("```", "").strip()
                 match = re.search(r'(\{.*\})', raw_text, re.DOTALL)
                 if match:
-                    cleaned_json = match.group(1).replace("'", '"')
+                    cleaned_json = match.group(1)
                     try: decision = json.loads(cleaned_json)
                     except: decision = ast.literal_eval(cleaned_json)
                 else: raise ValueError("No JSON found")
@@ -309,6 +355,16 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except: pass
                 await asyncio.sleep(0.5)
 
+            if decision.get('action') == 'build_plugin':
+                if not status_msg: status_msg = await msg.reply_text("⚙️ Building plugin...", parse_mode=ParseMode.HTML)
+                else:
+                    try: await status_msg.edit_text("⚙️ Building plugin...", parse_mode=ParseMode.HTML)
+                    except: pass
+                build_res = await PluginManager.develop_plugin(decision.get('instructions', ''))
+                user_text += f"\n\n[System: Plugin built. Result: {build_res}. If successful, output action 'run_plugin' to execute it.]"
+                current_level = "flash" if current_level == "lite" else "pro" if current_level == "flash" else current_level
+                continue
+
             if decision.get('action') == 'escalate':
                 thinking_enabled = decision.get('thinking_required', False)
                 current_level = "flash" if current_level == "lite" else "pro" if current_level == "flash" else None
@@ -316,16 +372,18 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Execution
         plugin_output = None
-        if decision.get('action') in ['run_plugin', 'build_plugin']:
+        if decision.get('action') == 'run_plugin':
             if not status_msg: status_msg = await msg.reply_text("⚡ Processing...")
-            if decision['action'] == 'run_plugin':
-                plugin_output = await PluginManager.run_plugin(decision['plugin_name'], decision.get('args', {}))
             else:
-                plugin_output = await PluginManager.develop_plugin(decision.get('instructions', ''))
+                try: await status_msg.edit_text("⚡ Processing...")
+                except: pass
+            plugin_output = await PluginManager.run_plugin(decision['plugin_name'], decision.get('args', {}))
         
         if status_msg:
             if decision.get('action') == 'reply': await status_msg.delete()
-            else: await status_msg.edit_text("✅ Background Task Complete.")
+            else:
+                try: await status_msg.edit_text("✅ Background Task Complete.")
+                except: pass
 
         # --- FORMATTING FINAL REPLY ---
         if decision.get('action') == 'reply':
@@ -369,6 +427,9 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if bot_state.memory_enabled.get(chat_id, True): 
                 mem = bot_state.memory.setdefault(chat_id, [])
                 mem.append({"role": "user", "parts": [user_text]})
+                mem.append({"role": "model", "parts": [final_text]})
+                if len(mem) > 20:
+                    bot_state.memory[chat_id] = mem[-20:]
 
     except Exception as e:
         logger.error(traceback.format_exc())
@@ -414,6 +475,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
 def main():
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN environment variable is missing. Exiting.")
+        sys.exit(1)
     while True:
         try:
             app = Application.builder().token(TELEGRAM_TOKEN).post_init(load_routines_on_startup).build()
