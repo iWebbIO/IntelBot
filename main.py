@@ -267,7 +267,22 @@ async def load_routines_on_startup(app: Application):
 # ==========================================
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    if not msg or not await check_access(update): return
+    if not msg: return
+
+    if msg.from_user and msg.from_user.is_bot:
+        return
+
+    is_group = msg.chat.type in ['group', 'supergroup']
+    if is_group:
+        bot_user = await context.bot.get_me()
+        is_reply_to_bot = msg.reply_to_message and msg.reply_to_message.from_user.id == bot_user.id
+        text_to_check = msg.text or msg.caption or ""
+        is_mentioned = f"@{bot_user.username}" in text_to_check
+        
+        if not (is_reply_to_bot or is_mentioned):
+            return
+
+    if not await check_access(update): return
     chat_id, user_id = msg.chat_id, update.effective_user.id
     
     if not key_manager.keys:
@@ -302,6 +317,10 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_text = f"User uploaded a file at path: {downloaded_file}. {msg.caption or ''}"
     else:
         user_text = msg.text or "[Attachment Processing]"
+
+    if is_group:
+        bot_user = await context.bot.get_me()
+        user_text = user_text.replace(f"@{bot_user.username}", "").strip()
 
     if msg.reply_to_message and msg.reply_to_message.text:
         user_text += f"\n[In reply to: {msg.reply_to_message.text}]"
@@ -443,14 +462,30 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 async def check_access(update: Update) -> bool:
     uid = update.effective_user.id
-    if bot_state.owner_id is None: await bot_state.set_owner(uid); return True
-    return str(uid) == bot_state.owner_id
+    cid = update.effective_chat.id
+    if bot_state.owner_id is None: 
+        await bot_state.set_owner(uid)
+        return True
+    if str(uid) == bot_state.owner_id:
+        return True
+        
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.cursor().execute("SELECT approved FROM whitelist WHERE id=? AND approved=1", (cid,)).fetchone()
+    conn.close()
+    return bool(row)
 
 async def add_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access(update): return
     if context.args: 
         await key_manager.add_key(context.args[0])
         await update.message.reply_text("✅ API Key Integrated.")
+
+async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != bot_state.owner_id: return
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    await execute_db_write("REPLACE INTO whitelist (id, type, approved) VALUES (?, ?, 1)", (chat_id, chat_type))
+    await update.message.reply_text("✅ Chat whitelisted.", parse_mode=ParseMode.HTML)
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -482,6 +517,7 @@ def main():
         try:
             app = Application.builder().token(TELEGRAM_TOKEN).post_init(load_routines_on_startup).build()
             app.add_handler(CommandHandler("addkey", add_key_command))
+            app.add_handler(CommandHandler("whitelist", whitelist_command))
             app.add_handler(CallbackQueryHandler(callback_handler))
             app.add_handler(MessageHandler(filters.TEXT | filters.VOICE | filters.Document.ALL, process_message))
             logger.info("Bot Online.")
