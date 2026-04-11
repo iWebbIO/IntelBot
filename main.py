@@ -239,7 +239,10 @@ async def execute_routine(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text=payload, parse_mode=ParseMode.HTML)
         else:
             res = await key_manager.execute(ai_manager.models["flash"], f"TASK: {payload}")
-            if res.text: await context.bot.send_message(chat_id=chat_id, text=res.text, parse_mode=ParseMode.HTML)
+            if res.text:
+                routine_text = html.unescape(res.text)
+                routine_text = re.sub(r'<br\s*/?>', '\n', routine_text, flags=re.IGNORECASE)
+                await context.bot.send_message(chat_id=chat_id, text=routine_text, parse_mode=ParseMode.HTML)
     except: pass
 
 async def load_routines_on_startup(app: Application):
@@ -345,7 +348,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sys_route = (
                     "Output VALID JSON ONLY.\n"
                     "Available Actions:\n"
-                    '- Chat: {"action": "reply", "text": "html formatted text"}\n'
+                    '- Chat: {"action": "reply", "text": "html formatted text (DO NOT escape HTML tags)"}\n'
                     '- Scrape: {"action": "run_plugin", "plugin_name": "web_scraper", "args": {"query": "search"}}\n'
                     '- Complex reasoning: {"action": "escalate", "thinking_required": true}\n'
                     f"{btn_inst}"
@@ -421,6 +424,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "- Supported tags: <b>bold</b>, <i>italic</i>, <code>code</code>.\n"
                 "- Use the • character for bullet points.\n"
                 "- DO NOT use Markdown (like ** or *).\n"
+                "- DO NOT escape HTML tags (e.g., use <b> not &lt;b&gt;).\n"
                 '- To add buttons, append <buttons>[[{"text":"Btn","url":"link"}]]</buttons> at the end.'
             )
             parts = [types.Part(text=f"SYSTEM: {sys_inst}\nHistory: {bot_state.memory.get(chat_id, [])}\nRaw Data: {plugin_output}\nUser: {user_text}")]
