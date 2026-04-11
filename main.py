@@ -196,33 +196,6 @@ class PluginManager:
         except json.JSONDecodeError:
             return {"output": stdout.decode(), "error": stderr.decode()}
 
-    @staticmethod
-    async def develop_plugin(prompt: str):
-        sys_inst = (
-            "You are an expert Python developer. Create a plugin script.\n"
-            "The script will be called via: python plugin.py '{\"arg\": \"val\"}'\n"
-            "It MUST read sys.argv[1] as JSON, process it, and print ONLY a valid JSON string to stdout.\n"
-            "Output YOUR RESPONSE strictly in this format:\n"
-            "FILENAME: plugin_name\n"
-            "DEPENDENCIES: pkg1,pkg2 (or NONE)\n"
-            "CODE:\n```python\n# code here\n```"
-        )
-        res = await key_manager.execute(ai_manager.models["flash"], sys_inst + "\n\nInstructions: " + prompt)
-        try:
-            text = res.text
-            filename = re.search(r'FILENAME:\s*(\w+)', text).group(1)
-            deps_match = re.search(r'DEPENDENCIES:\s*(.+)', text)
-            dependencies = [d.strip() for d in deps_match.group(1).split(',')] if deps_match and "none" not in deps_match.group(1).lower() else []
-            
-            code_match = re.search(r'```(?:python)?\n(.*?)\n```', text, re.DOTALL)
-            code = code_match.group(1) if code_match else text
-
-            if dependencies:
-                await asyncio.to_thread(lambda: [subprocess.run([sys.executable, "-m", "pip", "install", d]) for d in dependencies if d])
-            with open(PLUGIN_DIR / f"{filename}.py", "w", encoding="utf-8") as f: f.write(code)
-            return {"status": "success", "plugin": filename, "message": "Plugin built and ready."}
-        except Exception as e: return {"error": f"Build failed: {e}"}
-
 # Instances
 bot_state = BotState()
 key_manager = KeyRotationManager()
@@ -340,15 +313,22 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model_id = ai_manager.models[current_level]
             btn_inst = 'For buttons, append <buttons>[[{"text":"Btn","url":"link"}]]</buttons> to "text".'
             
-            # Instructed to use HTML for raw replies
             if current_level == "lite":
-                sys_route = f'Output VALID JSON ONLY.\nChat: {{"action": "reply", "text": "html formatted text"}}\nScrape: {{"action": "run_plugin", "plugin_name": "web_scraper", "args": {{"query": "search"}}}}\nNeed new tools/plugins or complex reasoning: {{"action": "escalate", "thinking_required": true}}\n{btn_inst}'
+                sys_route = (
+                    "Output VALID JSON ONLY.\n"
+                    "Available Actions:\n"
+                    '- Chat: {"action": "reply", "text": "html formatted text"}\n'
+                    '- Scrape: {"action": "run_plugin", "plugin_name": "web_scraper", "args": {"query": "search"}}\n'
+                    '- Complex reasoning: {"action": "escalate", "thinking_required": true}\n'
+                    f"{btn_inst}"
+                )
             else:
                 sys_route = (
                     f'JSON ONLY. Level: {current_level.upper()}.\n'
-                    f'You can extend your capabilities by writing Python plugins. If a user asks for a tool you lack, build it!\n'
-                    f'REQUIRED: "thought_summary" (short) and "thought_process".\n'
-                    f'Actions: "reply", "run_plugin" (needs "plugin_name", "args"), or "build_plugin" (needs "instructions" string describing the python script to generate).\n'
+                    "REQUIRED fields: 'thought_summary' (short) and 'thought_process'.\n"
+                    "Available Actions:\n"
+                    "- 'reply': needs 'text' field.\n"
+                    "- 'run_plugin': needs 'plugin_name' and 'args' fields.\n"
                     f'{btn_inst}'
                 )
 
@@ -383,16 +363,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except: pass
                 await asyncio.sleep(0.5)
 
-            if decision.get('action') == 'build_plugin':
-                if not status_msg: status_msg = await msg.reply_text("⚙️ Building plugin...", parse_mode=ParseMode.HTML)
-                else:
-                    try: await status_msg.edit_text("⚙️ Building plugin...", parse_mode=ParseMode.HTML)
-                    except: pass
-                build_res = await PluginManager.develop_plugin(decision.get('instructions', ''))
-                user_text += f"\n\n[System: Plugin built. Result: {build_res}. If successful, output action 'run_plugin' to execute it.]"
-                current_level = "flash" if current_level == "lite" else "pro" if current_level == "flash" else current_level
-                continue
-
             if decision.get('action') == 'escalate':
                 thinking_enabled = decision.get('thinking_required', False)
                 current_level = "flash" if current_level == "lite" else "pro" if current_level == "flash" else None
@@ -419,10 +389,11 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # HTML Formatting instructions
             sys_inst = (
-                'Format the raw data into a clean, readable response using Telegram HTML tags '
-                '(<b>bold</b>, <i>italic</i>, <code>code</code>). Use the • character for bullet points. '
-                'DO NOT use markdown like ** or *. '
-                'To add buttons, append <buttons>[[{"text":"Btn","url":"link"}]]</buttons> at the end.'
+                "Format the raw data into a clean, readable response using Telegram HTML tags:\n"
+                "- Supported tags: <b>bold</b>, <i>italic</i>, <code>code</code>.\n"
+                "- Use the • character for bullet points.\n"
+                "- DO NOT use Markdown (like ** or *).\n"
+                '- To add buttons, append <buttons>[[{"text":"Btn","url":"link"}]]</buttons> at the end.'
             )
             parts = [types.Part(text=f"SYSTEM: {sys_inst}\nHistory: {bot_state.memory.get(chat_id, [])}\nRaw Data: {plugin_output}\nUser: {user_text}")]
             if audio_content: parts.extend(audio_content.parts)
