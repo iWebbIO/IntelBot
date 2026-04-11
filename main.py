@@ -342,9 +342,15 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Instructed to use HTML for raw replies
             if current_level == "lite":
-                sys_route = f'Output VALID JSON ONLY.\nChat: {{"action": "reply", "text": "html formatted text"}}\nScrape: {{"action": "run_plugin", "plugin_name": "web_scraper", "args": {{"query": "search"}}}}\nComplex/Plugins: {{"action": "escalate", "thinking_required": true}}\n{btn_inst}'
+                sys_route = f'Output VALID JSON ONLY.\nChat: {{"action": "reply", "text": "html formatted text"}}\nScrape: {{"action": "run_plugin", "plugin_name": "web_scraper", "args": {{"query": "search"}}}}\nNeed new tools/plugins or complex reasoning: {{"action": "escalate", "thinking_required": true}}\n{btn_inst}'
             else:
-                sys_route = f'JSON ONLY. Level: {current_level.upper()}.\nREQUIRED: "thought_summary" (3 words) and "thought_process".\nAction: "reply", "run_plugin" (requires "plugin_name" and "args" dict), or "build_plugin" (requires "instructions" string describing the script).\n{btn_inst}'
+                sys_route = (
+                    f'JSON ONLY. Level: {current_level.upper()}.\n'
+                    f'You can extend your capabilities by writing Python plugins. If a user asks for a tool you lack, build it!\n'
+                    f'REQUIRED: "thought_summary" (short) and "thought_process".\n'
+                    f'Actions: "reply", "run_plugin" (needs "plugin_name", "args"), or "build_plugin" (needs "instructions" string describing the python script to generate).\n'
+                    f'{btn_inst}'
+                )
 
             chat_history = str(bot_state.memory.get(chat_id, [])[-10:])
             parts = [types.Part(text=sys_route + f"\nHistory: {chat_history}\nUser: " + user_text)]
