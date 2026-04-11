@@ -265,34 +265,51 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if str(user_id) == bot_state.owner_id: await msg.reply_text("🛑 No API keys. Use /addkey <key>.")
         return
 
-    # Handle Voice and Documents
-    audio_content = None
-    downloaded_file = None
+    # Handle Various Media Types
+    media_content = None
     status_msg = None
     
-    if msg.voice:
-        status_msg = await msg.reply_text("🎧 Listening...")
-        file = await context.bot.get_file(msg.voice.file_id)
-        path = f"v_{msg.voice.file_id}.ogg"
-        await file.download_to_drive(path)
-        client = genai.Client(api_key=key_manager.keys[0])
-        upload = await asyncio.to_thread(client.files.upload, file=path)
-        audio_content = types.Content(parts=[types.Part(file_data=types.FileData(file_uri=upload.uri, mime_type=upload.mime_type))])
-        os.remove(path)
-        await status_msg.delete()
-        status_msg = None
-    elif msg.document:
-        status_msg = await msg.reply_text("📥 Downloading file...")
-        file = await context.bot.get_file(msg.document.file_id)
-        downloaded_file = str(Path(msg.document.file_name or f"file_{msg.document.file_id}").resolve())
-        await file.download_to_drive(downloaded_file)
-        await status_msg.delete()
-        status_msg = None
+    media_obj, ext = None, ""
+    if msg.photo: media_obj, ext = msg.photo[-1], ".jpg"
+    elif msg.voice: media_obj, ext = msg.voice, ".ogg"
+    elif msg.audio: media_obj, ext = msg.audio, ".mp3"
+    elif msg.video: media_obj, ext = msg.video, ".mp4"
+    elif msg.video_note: media_obj, ext = msg.video_note, ".mp4"
+    elif msg.animation: media_obj, ext = msg.animation, ".mp4"
+    elif msg.document: media_obj, ext = msg.document, ""
 
-    if downloaded_file:
-        user_text = f"User uploaded a file at path: {downloaded_file}. {msg.caption or ''}"
-    else:
-        user_text = msg.text or "[Attachment Processing]"
+    if media_obj:
+        status_msg = await msg.reply_text("📥 Processing media context...")
+        file = await context.bot.get_file(media_obj.file_id)
+        filename = getattr(media_obj, 'file_name', None) or f"media_{media_obj.file_id}{ext}"
+        path = str(Path(filename).resolve())
+        await file.download_to_drive(path)
+        
+        try:
+            client = genai.Client(api_key=key_manager.keys[0])
+            upload = await asyncio.to_thread(client.files.upload, file=path)
+            
+            # Wait for processing (Crucial for larger files and videos)
+            while True:
+                state = getattr(upload, 'state', None)
+                state_str = getattr(state, 'name', str(state)) if state else ""
+                if "PROCESSING" not in state_str: break
+                await asyncio.sleep(2)
+                upload = await asyncio.to_thread(client.files.get, name=upload.name)
+                
+            media_content = types.Content(parts=[types.Part(file_data=types.FileData(file_uri=upload.uri, mime_type=upload.mime_type))])
+        except Exception as e:
+            logger.error(f"Media upload failed: {e}")
+            await msg.reply_text(f"⚠️ Failed to process media: {e}")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+            
+        if status_msg:
+            await status_msg.delete()
+            status_msg = None
+
+    user_text = msg.text or msg.caption or "[Attachment Processing]"
 
     if is_group:
         bot_user = await context.bot.get_me()
@@ -334,7 +351,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             chat_history = str(bot_state.memory.get(chat_id, [])[-10:])
             parts = [types.Part(text=sys_route + f"\nHistory: {chat_history}\nUser: " + user_text)]
-            if audio_content: parts.extend(audio_content.parts)
+            if media_content: parts.extend(media_content.parts)
             
             res = await key_manager.execute(model_id, [types.Content(parts=parts)])
             
@@ -396,7 +413,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 '- To add buttons, append <buttons>[[{"text":"Btn","url":"link"}]]</buttons> at the end.'
             )
             parts = [types.Part(text=f"SYSTEM: {sys_inst}\nHistory: {bot_state.memory.get(chat_id, [])}\nRaw Data: {plugin_output}\nUser: {user_text}")]
-            if audio_content: parts.extend(audio_content.parts)
+            if media_content: parts.extend(media_content.parts)
             
             format_res = await key_manager.execute(ai_manager.models["lite"], [types.Content(parts=parts)])
             final_text = format_res.text if format_res.text else str(plugin_output)
@@ -502,7 +519,11 @@ def main():
             app.add_handler(CommandHandler("addkey", add_key_command))
             app.add_handler(CommandHandler("whitelist", whitelist_command))
             app.add_handler(CallbackQueryHandler(callback_handler))
-            app.add_handler(MessageHandler(filters.TEXT | filters.VOICE | filters.Document.ALL, process_message))
+            app.add_handler(MessageHandler(
+                filters.TEXT | filters.VOICE | filters.AUDIO | filters.PHOTO | 
+                filters.VIDEO | filters.VIDEO_NOTE | filters.ANIMATION | filters.Document.ALL, 
+                process_message
+            ))
             logger.info("Bot Online.")
             app.run_polling(drop_pending_updates=True)
             break
