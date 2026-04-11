@@ -207,7 +207,7 @@ class PluginManager:
             "DEPENDENCIES: pkg1,pkg2 (or NONE)\n"
             "CODE:\n```python\n# code here\n```"
         )
-        res = await key_manager.execute(ai_manager.models["pro"], sys_inst + "\n\nInstructions: " + prompt)
+        res = await key_manager.execute(ai_manager.models["flash"], sys_inst + "\n\nInstructions: " + prompt)
         try:
             text = res.text
             filename = re.search(r'FILENAME:\s*(\w+)', text).group(1)
