@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import html
 import json
 import uuid
 import asyncio
@@ -49,10 +50,13 @@ DB_FILE = "bot_data.db"
 # ==========================================
 # 2. DATABASE ENGINE
 # ==========================================
-db_lock = asyncio.Lock()
+_db_lock = None
 
 async def execute_db_write(query: str, params: tuple = ()):
-    async with db_lock:
+    global _db_lock
+    if _db_lock is None:
+        _db_lock = asyncio.Lock()
+    async with _db_lock:
         def _write():
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
@@ -88,7 +92,7 @@ class BotState:
         self.owner_id = self._load_setting("owner_id")
         self.memory = {} 
         self.memory_enabled = {}
-        self.memory_locks = defaultdict(asyncio.Lock) 
+        self._memory_locks = {} 
         self.thoughts = {} 
         
     def _load_setting(self, key):
@@ -101,11 +105,16 @@ class BotState:
         self.owner_id = str(user_id)
         await execute_db_write("REPLACE INTO settings (key, value) VALUES (?, ?)", ("owner_id", self.owner_id))
 
+    def get_lock(self, chat_id):
+        if chat_id not in self._memory_locks:
+            self._memory_locks[chat_id] = asyncio.Lock()
+        return self._memory_locks[chat_id]
+
 class KeyRotationManager:
     def __init__(self):
         self.last_used_key = None
         self.keys = []
-        self.lock = asyncio.Lock()
+        self._lock = None
         self.refresh_keys()
 
     def refresh_keys(self):
@@ -130,7 +139,9 @@ class KeyRotationManager:
     async def execute(self, model_id, contents):
         self.refresh_keys()
         attempts = len(self.keys)
-        async with self.lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
             for _ in range(attempts):
                 current_key = self._get_next_key()
                 client = genai.Client(api_key=current_key)
@@ -418,6 +429,10 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             format_res = await key_manager.execute(ai_manager.models["lite"], [types.Content(parts=parts)])
             final_text = format_res.text if format_res.text else str(plugin_output)
         
+        # Clean up escaped HTML and convert <br> tags to newlines for Telegram
+        final_text = html.unescape(final_text)
+        final_text = re.sub(r'<br\s*/?>', '\n', final_text, flags=re.IGNORECASE)
+
         reply_markup = None
         btn_match = re.search(r'<buttons>(.*?)</buttons>', final_text, re.DOTALL)
         if btn_match:
@@ -439,7 +454,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await send_smart_reply(msg, final_text, reply_markup=reply_markup)
         
-        async with bot_state.memory_locks[chat_id]:
+        async with bot_state.get_lock(chat_id):
             if bot_state.memory_enabled.get(chat_id, True): 
                 mem = bot_state.memory.setdefault(chat_id, [])
                 mem.append({"role": "user", "parts": [user_text]})
@@ -515,6 +530,13 @@ def main():
         sys.exit(1)
     while True:
         try:
+            # Ensure a clean event loop and reset global locks on restart
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            global _db_lock
+            _db_lock = None
+            key_manager._lock = None
+            bot_state._memory_locks.clear()
+
             app = Application.builder().token(TELEGRAM_TOKEN).post_init(load_routines_on_startup).build()
             app.add_handler(CommandHandler("addkey", add_key_command))
             app.add_handler(CommandHandler("whitelist", whitelist_command))
